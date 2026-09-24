@@ -1,79 +1,185 @@
 #include <WiFi.h>
-#include <WebServer.h>
+#include <time.h>
 
-// Pines del sensor ultrasónico
-#define TRIG_PIN 12
-#define ECHO_PIN 13
+// ================= CONFIGURACIÓN DE RED Y HORA =================
+const char* ssid       = "TU_RED_WIFI";
+const char* password   = "TU_CONTRASEÑA";
+const char* ntpServer  = "pool.ntp.org";
+const long  gmtOffset_sec = -21600; // Ajusta a tu zona horaria (Ej: -21600 para CST)
+const int   daylightOffset_sec = 0;
 
-long duracion;
-float distancia;
+// ================= PINES DE HARDWARE =================
+const int trigPin = 5;
+const int echoPin = 18;
+const int bombaLlenadoPin = 19;
+const int bombaExtraccionPin = 21;
 
-// Dimensiones del recipiente
-const float altura = 12.0;   // cm
-const float radio = 7.0;     // cm
-const float volumenTotal = 3.1416 * radio * radio * altura;
+// ================= CONFIGURACIÓN DEL RECIPIENTE =================
+// 1 = Cilíndrico, 2 = Rectangular/Cuadrado
+const int TIPO_RECIPIENTE = 1; 
 
-// Configuración Access Point
-const char* ssid = "ESP32_CapTank";
-const char* password = "12345678";   // mínimo 8 caracteres
+// Medidas en centímetros (cm)
+const float ALTURA_TOTAL = 100.0; 
+const float DISTANCIA_SENSOR_AL_AGUA_MAX = 5.0; // Espacio muerto en la parte superior
+const float DIAMETRO = 50.0;     // Solo para cilindro
+const float ANCHO = 40.0;        // Solo para rectangular/cuadrado
+const float LARGO = 40.0;        // Solo para rectangular/cuadrado
 
-WebServer server(80);
+// Tasa de extracción estimada (Litros por minuto) para calcular el tiempo restante
+const float TASA_EXTRACCION_LPM = 5.0; 
 
-float porcentajeAgua = 0;
+// ================= VARIABLES DE ESTADO =================
+float porcentajeActual = 0;
+float litrosActuales = 0;
+bool llenando = false;
+bool alerta15Enviada = false;
+bool autorizacionUso = false; // Requiere confirmación para usar < 15%
 
-void calcularDatos() {
-  float alturaAgua = altura - distancia;
-  if (alturaAgua < 0) alturaAgua = 0;
-
-  float volumenAgua = 3.1416 * radio * radio * alturaAgua;
-  porcentajeAgua = (volumenAgua / volumenTotal) * 100;
-}
-
-void handleRoot() {
-  server.send(200, "text/plain", "Servidor ESP32 activo en modo AP");
-}
-
-void handleData() {
-  String json = "{\"porcentaje\":" + String(porcentajeAgua) + "}";
-  server.send(200, "application/json", json);
-}
+// Horarios de riego/extracción (Ejemplo: 08:00 y 18:00)
+const int horaRiego1 = 8;
+const int horaRiego2 = 18;
+const int duracionRiegoMinutos = 10;
+bool extraccionActivaPorTemporizador = false;
 
 void setup() {
   Serial.begin(115200);
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
+  
+  // Configuración de pines
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  pinMode(bombaLlenadoPin, OUTPUT);
+  pinMode(bombaExtraccionPin, OUTPUT);
+  
+  // Apagar bombas al inicio (Lógica inversa para módulos relé: HIGH = apagado, LOW = encendido)
+  digitalWrite(bombaLlenadoPin, HIGH);
+  digitalWrite(bombaExtraccionPin, HIGH);
 
-  // Iniciar Access Point
-  WiFi.softAP(ssid, password);
-  IPAddress IP = WiFi.softAPIP();
-  Serial.println("✅ Access Point iniciado");
-  Serial.print("SSID: ");
-  Serial.println(ssid);
-  Serial.print("Password: ");
-  Serial.println(password);
-  Serial.print("IP del ESP32: ");
-  Serial.println(IP);
+  // Conectar a WiFi
+  Serial.print("Conectando a WiFi");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConectado al WiFi.");
 
-  // Configurar servidor web
-  server.on("/", handleRoot);
-  server.on("/data", handleData);
-  server.begin();
-  Serial.println("Servidor web iniciado en http://" + IP.toString());
+  // Configurar la hora
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
 }
 
 void loop() {
-  // Medición ultrasónica
-  digitalWrite(TRIG_PIN, LOW);
+  float distancia = medirDistancia();
+  calcularNivelYVolumen(distancia);
+  controlarBombaLlenado();
+  verificarTemporizadorExtraccion();
+  procesarAutorizacionSerial();
+  
+  delay(2000); // Esperar 2 segundos entre lecturas
+}
+
+// ================= FUNCIONES PRINCIPALES =================
+
+float medirDistancia() {
+  digitalWrite(trigPin, LOW);
   delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);
+  digitalWrite(trigPin, HIGH);
   delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);
+  digitalWrite(trigPin, LOW);
+  
+  long duracion = pulseIn(echoPin, HIGH);
+  float distancia_cm = duracion * 0.034 / 2;
+  return distancia_cm;
+}
 
-  duracion = pulseIn(ECHO_PIN, HIGH);
-  distancia = duracion * 0.034 / 2;
+void calcularNivelYVolumen(float distancia) {
+  // Evitar lecturas fuera de rango
+  if(distancia > ALTURA_TOTAL) distancia = ALTURA_TOTAL;
+  if(distancia < DISTANCIA_SENSOR_AL_AGUA_MAX) distancia = DISTANCIA_SENSOR_AL_AGUA_MAX;
 
-  calcularDatos();
-  server.handleClient();
+  // Calcular porcentaje
+  float rangoUtil = ALTURA_TOTAL - DISTANCIA_SENSOR_AL_AGUA_MAX;
+  float nivelAgua = ALTURA_TOTAL - distancia;
+  porcentajeActual = (nivelAgua / rangoUtil) * 100.0;
 
-  delay(500);
+  // Calcular Volumen en Litros (1 cm3 = 0.001 Litros)
+  if (TIPO_RECIPIENTE == 1) { // Cilíndrico
+    float radio = DIAMETRO / 2.0;
+    litrosActuales = (PI * pow(radio, 2) * nivelAgua) * 0.001;
+  } else if (TIPO_RECIPIENTE == 2) { // Rectangular
+    litrosActuales = (ANCHO * LARGO * nivelAgua) * 0.001;
+  }
+
+  Serial.printf("Nivel: %.1f%% | Volumen: %.1f Litros\n", porcentajeActual, litrosActuales);
+}
+
+void controlarBombaLlenado() {
+  // Encendido automático al 15%
+  if (porcentajeActual <= 15.0 && !llenando) {
+    llenando = true;
+    digitalWrite(bombaLlenadoPin, LOW); // Encender bomba
+    Serial.println(">>> ALERTA: Nivel al 15%. Bomba de llenado ENCENDIDA.");
+    
+    if (!alerta15Enviada) {
+      float minutosRestantes = litrosActuales / TASA_EXTRACCION_LPM;
+      Serial.printf(">>> AVISO: Queda un 15%% (%.1f L). A la tasa actual, rendirá para %.1f minutos.\n", litrosActuales, minutosRestantes);
+      Serial.println(">>> La extracción está pausada. Escribe 'AUTORIZAR' en el monitor serie para seguir usando el agua restante.");
+      alerta15Enviada = true;
+      autorizacionUso = false; // Revocamos permiso hasta que el usuario confirme
+    }
+  }
+
+  // Apagado automático al 100%
+  if (porcentajeActual >= 99.0 && llenando) {
+    llenando = false;
+    alerta15Enviada = false; // Resetear la alerta para el próximo ciclo
+    autorizacionUso = true;  // Vuelve a tener agua de sobra
+    digitalWrite(bombaLlenadoPin, HIGH); // Apagar bomba
+    Serial.println(">>> Nivel al 100%. Bomba de llenado APAGADA.");
+  }
+}
+
+void verificarTemporizadorExtraccion() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return; // Si no hay hora, no hacer nada
+
+  int horaActual = timeinfo.tm_hour;
+  int minutoActual = timeinfo.tm_min;
+
+  // Lógica de encendido por horario (08:00 a 08:10 y 18:00 a 18:10)
+  bool esHoraDeRiego = ((horaActual == horaRiego1 || horaActual == horaRiego2) && minutoActual < duracionRiegoMinutos);
+
+  if (esHoraDeRiego) {
+    // Si estamos por debajo del 15% y no hay autorización, NO encender
+    if (porcentajeActual <= 15.0 && !autorizacionUso) {
+      digitalWrite(bombaExtraccionPin, HIGH); // Apagada por seguridad
+      if(!extraccionActivaPorTemporizador) {
+         Serial.println(">>> Extracción programada denegada: Nivel crítico y sin autorización.");
+         extraccionActivaPorTemporizador = true; // Para no spam a la consola
+      }
+    } else {
+      digitalWrite(bombaExtraccionPin, LOW); // Encendida
+      if(!extraccionActivaPorTemporizador) {
+        Serial.println(">>> Temporizador: Bomba de extracción ENCENDIDA.");
+        extraccionActivaPorTemporizador = true;
+      }
+    }
+  } else {
+    digitalWrite(bombaExtraccionPin, HIGH); // Apagada fuera de horario
+    if(extraccionActivaPorTemporizador) {
+      Serial.println(">>> Temporizador: Bomba de extracción APAGADA (fin del tiempo).");
+      extraccionActivaPorTemporizador = false;
+    }
+  }
+}
+
+void procesarAutorizacionSerial() {
+  if (Serial.available() > 0) {
+    String comando = Serial.readStringUntil('\n');
+    comando.trim(); // Eliminar espacios
+    
+    if (comando.equalsIgnoreCase("AUTORIZAR")) {
+      autorizacionUso = true;
+      Serial.println(">>> AUTORIZACIÓN ACEPTADA. La bomba de extracción puede seguir operando con el 15% restante.");
+    }
+  }
 }
